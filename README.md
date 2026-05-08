@@ -1,6 +1,5 @@
 # 🧪 Intelligent Test Automation Agent
 
-> **Senior RDE AI Engineer Certification Project**  
 > Accelerating Engineering Through AI-First Agentic Solutions
 
 ---
