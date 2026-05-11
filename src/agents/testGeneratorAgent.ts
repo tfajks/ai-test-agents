@@ -14,13 +14,19 @@ const SYSTEM_VITEST = `You are a senior QA engineer. Generate a COMPLETE, produc
 
 Output ONLY the raw .test.ts file content — no explanation, no markdown fences, no XML tags. The file must be complete and not truncated.
 
+CRITICAL — write CONCISE tests to stay within token limits:
+- Use it.each([...]) for similar cases (variants, sizes, states) — never write separate it() blocks for each value
+- One assertion per it() where possible — avoid restating the same fact multiple times
+- Group all variant rendering into a single it.each, all size rendering into another
+- Do NOT write comments inside test bodies
+
 Rules:
 - Single top-level describe block named after the module
 - it('should X when Y') naming
 - vi.mock() for ALL external imports at the top
 - beforeEach(() => vi.clearAllMocks())
 - AAA pattern: Arrange / Act / Assert
-- Cover: happy path, all error paths, boundary values (0, max, max+1), edge cases
+- Cover: happy path, disabled state, ref forwarding, asChild prop, all variants (via it.each), all sizes (via it.each)
 - For validators/services: test every public method thoroughly`
 
 const SYSTEM_PLAYWRIGHT = `You are a senior QA engineer. Generate a COMPLETE, production-ready Playwright e2e test file for the provided React/Next.js source file.
