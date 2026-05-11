@@ -7,7 +7,7 @@ import { Logger } from '../logger'
 import { ChangedFile, GeneratedTestBundle, TestGeneratorAgentOutput } from '../types'
 
 const MAX_FILE_CHARS = 24000
-const MAX_TOKENS = 8192
+const MAX_TOKENS = 16384
 
 // Separate system prompts per test type — each call gets a full token budget
 const SYSTEM_VITEST = `You are a senior QA engineer. Generate a COMPLETE, production-ready Vitest unit test file for the provided TypeScript/JavaScript source file.
