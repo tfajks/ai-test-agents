@@ -4,6 +4,7 @@ import { GitHubTool } from './tools/githubTool'
 import { ClaudeTool } from './tools/claudeTool'
 import { MemoryStore } from './memory/memoryStore'
 import { AuditLog } from './audit/auditLog'
+import { Logger } from './logger'
 import { IngestAgent } from './agents/ingestAgent'
 import { TestGeneratorAgent } from './agents/testGeneratorAgent'
 import { ReportAgent } from './agents/reportAgent'
@@ -13,6 +14,7 @@ export async function runPipeline(input: PipelineInput): Promise<void> {
   const sessionId = crypto.randomUUID()
   const memoryStore = new MemoryStore(sessionId)
   const auditLog = new AuditLog()
+  const logger = new Logger()
 
   const githubToken = process.env.GITHUB_TOKEN
   if (!githubToken) throw new Error('GITHUB_TOKEN is required')
@@ -24,30 +26,26 @@ export async function runPipeline(input: PipelineInput): Promise<void> {
   const dryRun = input.dryRun ?? false
   const outBase = `output/pr-${input.pullNumber}`
 
-  console.log(`[Pipeline] Session ${sessionId} — PR #${input.pullNumber} on ${input.owner}/${input.repo}`)
+  console.log(`\nSession ${sessionId}`)
+  console.log(`PR #${input.pullNumber}  ·  ${input.owner}/${input.repo}  ·  ${dryRun ? 'dry-run' : 'live'}\n`)
 
-  // Step 1: Ingest
-  console.log('[Pipeline] Running IngestAgent...')
-  const ingestAgent = new IngestAgent(githubTool, claudeTool, memoryStore, auditLog)
+  const ingestAgent = new IngestAgent(githubTool, claudeTool, memoryStore, auditLog, logger)
   await ingestAgent.run(input)
   await memoryStore.save(`${outBase}/memory_state.json`)
 
-  // Step 2: Test Generation
-  console.log('[Pipeline] Running TestGeneratorAgent...')
-  const testGeneratorAgent = new TestGeneratorAgent(claudeTool, memoryStore, auditLog)
+  const testGeneratorAgent = new TestGeneratorAgent(claudeTool, memoryStore, auditLog, logger)
   await testGeneratorAgent.run(input.pullNumber, baseUrl)
   await memoryStore.save(`${outBase}/memory_state.json`)
 
-  // Step 3: Report
-  console.log('[Pipeline] Running ReportAgent...')
-  const reportAgent = new ReportAgent(githubTool, claudeTool, memoryStore, auditLog)
+  const reportAgent = new ReportAgent(githubTool, claudeTool, memoryStore, auditLog, logger)
   const report = await reportAgent.run(input.owner, input.repo, input.pullNumber, dryRun)
   await memoryStore.save(`${outBase}/memory_state.json`)
 
-  // Save audit log
   await auditLog.save(`${outBase}/audit_log.json`)
 
-  console.log(`[Pipeline] Done — Go/No-Go: ${report.goNoGo} | Avg score: ${report.averageScore}/10`)
+  console.log(`\nAudit log  → ${outBase}/audit_log.json`)
+  console.log(`Memory     → ${outBase}/memory_state.json`)
+  console.log(`Report     → ${outBase}/report.json\n`)
 
   if (require.main === module && report.goNoGo === 'no-go') {
     process.exit(1)
@@ -61,7 +59,6 @@ async function main(): Promise<void> {
   const latestFlag = args.includes('--latest')
   const dryRun = args.includes('--dry-run')
   const baseUrlIdx = args.indexOf('--base-url')
-
   const baseUrl = baseUrlIdx !== -1 ? args[baseUrlIdx + 1] : undefined
 
   const owner = process.env.GITHUB_OWNER

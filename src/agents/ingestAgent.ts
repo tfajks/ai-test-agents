@@ -3,6 +3,7 @@ import { GitHubTool } from '../tools/githubTool'
 import { ClaudeTool } from '../tools/claudeTool'
 import { MemoryStore } from '../memory/memoryStore'
 import { AuditLog } from '../audit/auditLog'
+import { Logger } from '../logger'
 import {
   ChangedFile,
   FileCategory,
@@ -37,15 +38,20 @@ export class IngestAgent {
     private githubTool: GitHubTool,
     private claudeTool: ClaudeTool,
     private memoryStore: MemoryStore,
-    private auditLog: AuditLog
+    private auditLog: AuditLog,
+    private logger: Logger
   ) {}
 
   async run(input: PipelineInput): Promise<IngestAgentOutput> {
+    this.logger.section('INGEST AGENT', '🔍')
     this.auditLog.log({ agent: 'IngestAgent', action: 'STARTED', input })
 
+    this.logger.step(`Fetching PR #${input.pullNumber} from ${input.owner}/${input.repo}`)
     const pr = await this.githubTool.getPullRequest(input.owner, input.repo, input.pullNumber)
+    this.logger.ok(`PR: "${pr.title}" by @${pr.author}`)
     this.auditLog.log({ agent: 'IngestAgent', action: 'PR_FETCHED', output: { title: pr.title, author: pr.author } })
 
+    this.logger.step('Fetching changed files')
     const rawFiles = await this.githubTool.listChangedFiles(input.owner, input.repo, input.pullNumber)
     this.auditLog.log({ agent: 'IngestAgent', action: 'FILES_FETCHED', output: { count: rawFiles.length } })
 
@@ -71,15 +77,15 @@ export class IngestAgent {
         pr.headSha
       )
       if (content !== null) {
-        filesWithContent.push({
-          filename: f.filename,
-          additions: f.additions,
-          deletions: f.deletions,
-          content,
-        })
+        filesWithContent.push({ filename: f.filename, additions: f.additions, deletions: f.deletions, content })
+        this.logger.ok(`${f.filename}  (+${f.additions}/-${f.deletions})`)
+      } else {
+        this.logger.skip(`${f.filename}  (skipped — binary or missing)`)
       }
     }
 
+    this.logger.step('Classifying files with Claude')
+    this.logger.streamHeader('classification')
     this.auditLog.log({
       agent: 'IngestAgent',
       action: 'CLASSIFYING',
@@ -87,6 +93,7 @@ export class IngestAgent {
     })
 
     const classification = await this.classify(filesWithContent)
+    this.logger.streamEnd()
 
     this.auditLog.log({
       agent: 'IngestAgent',
@@ -134,6 +141,11 @@ export class IngestAgent {
       },
     }
 
+    for (const f of changedFiles) {
+      const riskColor = { low: '🟢', medium: '🟡', high: '🟠', critical: '🔴' }[f.risk]
+      this.logger.info(`${riskColor} ${f.path}  [${f.category.join(', ')}]  endpoints: ${f.detectedEndpoints.length}`)
+    }
+
     this.memoryStore.set('ingest', output)
     this.auditLog.log({ agent: 'IngestAgent', action: 'COMPLETED', output: output.summary })
     return output
@@ -178,6 +190,8 @@ Respond with:
   ]
 }`
 
-    return this.claudeTool.completeJSON<ClassificationResult>(systemPrompt, userPrompt)
+    return this.claudeTool.completeJSON<ClassificationResult>(systemPrompt, userPrompt, {
+      onToken: (t) => this.logger.token(t),
+    })
   }
 }

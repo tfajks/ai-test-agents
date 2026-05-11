@@ -3,3 +3,8 @@ dist/
 output/
 .env
 *.js.map
+*.zip
+tmp_*.tsx
+tmp_*.ts
+eb-service-trust.json
+trust-policy.json

@@ -1,6 +1,13 @@
 import { Octokit } from '@octokit/rest'
 import { PullRequestMeta } from '../types'
 
+// Suppress Octokit deprecation warnings for getContent (scheduled removal 2028)
+const originalWarn = console.warn
+console.warn = (...args: unknown[]) => {
+  if (typeof args[0] === 'string' && args[0].includes('@octokit/request')) return
+  originalWarn(...args)
+}
+
 export interface RawChangedFile {
   filename: string
   status: 'added' | 'modified' | 'removed' | 'renamed' | 'copied' | 'changed' | 'unchanged'

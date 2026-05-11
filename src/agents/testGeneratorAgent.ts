@@ -3,38 +3,52 @@ import path from 'path'
 import { ClaudeTool } from '../tools/claudeTool'
 import { MemoryStore } from '../memory/memoryStore'
 import { AuditLog } from '../audit/auditLog'
-import { ChangedFile, GeneratedTestBundle, GeneratedTestFile, TestGeneratorAgentOutput } from '../types'
+import { Logger } from '../logger'
+import { ChangedFile, GeneratedTestBundle, TestGeneratorAgentOutput } from '../types'
 
 const MAX_FILE_CHARS = 24000
+const MAX_TOKENS = 8192
 
-const SYSTEM_PROMPT = `You are a senior QA engineer. Generate production-ready tests for the provided TypeScript/JavaScript source file.
+// Separate system prompts per test type — each call gets a full token budget
+const SYSTEM_VITEST = `You are a senior QA engineer. Generate a COMPLETE, production-ready Vitest unit test file for the provided TypeScript/JavaScript source file.
 
-Output your response using ONLY these XML tags — no other text, no explanation, no markdown:
-
-<vitest>
-[complete .test.ts file using describe/it/expect, vi.mock() for all external deps, AAA pattern, edge cases and error paths]
-</vitest>
-<playwright>
-[complete .spec.ts file using Page Object Model, getByRole() selectors, web-first assertions, happy path + validation + error states]
-[write SKIP if no React/Vue components or page routes are present]
-</playwright>
-<k6>
-[complete .k6.js file with smoke+load stages, check() assertions, tagged requests, thresholds p(95)<500ms, __ENV.BASE_URL]
-[write SKIP if no HTTP endpoints are defined in this file]
-</k6>
+Output ONLY the raw .test.ts file content — no explanation, no markdown fences, no XML tags. The file must be complete and not truncated.
 
 Rules:
-- vitest: describe block named after module, it('should X when Y'), vi.mock() for all imports, beforeEach(() => vi.clearAllMocks())
-- playwright: Page Object class, test.beforeEach to navigate, no waitForTimeout() ever
-- k6: export const options with stages and thresholds, check() on status+time+body, sleep(1) between requests`
+- Single top-level describe block named after the module
+- it('should X when Y') naming
+- vi.mock() for ALL external imports at the top
+- beforeEach(() => vi.clearAllMocks())
+- AAA pattern: Arrange / Act / Assert
+- Cover: happy path, all error paths, boundary values (0, max, max+1), edge cases
+- For validators/services: test every public method thoroughly`
 
-function parseXmlSection(text: string, tag: string): string | null {
-  const regex = new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`)
-  const match = text.match(regex)
-  if (!match) return null
-  const content = match[1].trim()
-  return content === 'SKIP' || content === '' ? null : content
-}
+const SYSTEM_PLAYWRIGHT = `You are a senior QA engineer. Generate a COMPLETE, production-ready Playwright e2e test file for the provided React/Next.js source file.
+
+Output ONLY the raw .spec.ts file content — no explanation, no markdown fences, no XML tags. The file must be complete and not truncated.
+
+Write SKIP (just that word) if the file contains no React components or page routes.
+
+Rules:
+- Page Object Model class with typed locators
+- test.beforeEach to navigate to the correct route
+- Use data-testid selectors where available, getByRole() otherwise
+- NEVER use waitForTimeout() — use web-first assertions
+- Cover: happy path, keyboard interactions, validation states, disabled states`
+
+const SYSTEM_K6 = `You are a senior QA engineer. Generate a COMPLETE, production-ready k6 performance test file for the provided API route source file.
+
+Output ONLY the raw .k6.js file content — no explanation, no markdown fences, no XML tags. The file must be complete and not truncated.
+
+Write SKIP (just that word) if the file contains no HTTP endpoints.
+
+Rules:
+- export const options with stages: smoke(30s/2vus) + ramp(1m/20) + sustained(2m/20) + down(30s/0)
+- thresholds: http_req_duration p(95)<500, errors rate<0.05
+- __ENV.BASE_URL fallback to localhost
+- check() every response: status + timing + body shape
+- Cover: valid payload, missing required fields (400), unsupported values (400/422), empty body
+- Custom Trend metric for the primary endpoint duration`
 
 function truncateToExports(content: string): string {
   const lines = content.split('\n')
@@ -44,14 +58,20 @@ function truncateToExports(content: string): string {
   return exportLines.join('\n') + '\n// (file truncated — only exported signatures shown)'
 }
 
+function isSkip(text: string): boolean {
+  return text.trim().toUpperCase() === 'SKIP' || text.trim() === ''
+}
+
 export class TestGeneratorAgent {
   constructor(
     private claudeTool: ClaudeTool,
     private memoryStore: MemoryStore,
-    private auditLog: AuditLog
+    private auditLog: AuditLog,
+    private logger: Logger
   ) {}
 
   async run(pullNumber: number, baseUrl: string): Promise<TestGeneratorAgentOutput> {
+    this.logger.section('TEST GENERATOR AGENT', '⚡')
     this.auditLog.log({ agent: 'TestGeneratorAgent', action: 'STARTED', input: { pullNumber, baseUrl } })
 
     const ingest = this.memoryStore.get('ingest')
@@ -66,22 +86,22 @@ export class TestGeneratorAgent {
     const outBase = `output/pr-${pullNumber}`
 
     for (const file of changedFiles) {
-      this.auditLog.log({
-        agent: 'TestGeneratorAgent',
-        action: 'GENERATING',
-        input: { path: file.path },
-      })
+      const fileIdx = changedFiles.indexOf(file) + 1
+      this.logger.section(`[${fileIdx}/${changedFiles.length}] ${path.basename(file.path)}`, '📄')
+      this.logger.info(`risk: ${file.risk}  |  endpoints: ${file.detectedEndpoints.join(', ') || 'none'}`)
+      this.auditLog.log({ agent: 'TestGeneratorAgent', action: 'GENERATING', input: { path: file.path } })
 
       try {
         const bundle = await this.generateForFile(file, pullNumber, baseUrl, outBase)
 
         if (!bundle.vitest && !bundle.playwright && !bundle.k6) {
           skippedFiles.push(file.path)
+          this.logger.skip('All test types returned SKIP — no testable logic found')
           this.auditLog.log({
             agent: 'TestGeneratorAgent',
             action: 'SKIPPED',
             input: { path: file.path },
-            reasoning: 'All test sections returned SKIP or were empty',
+            reasoning: 'All test types returned SKIP or were empty',
           })
           continue
         }
@@ -89,9 +109,12 @@ export class TestGeneratorAgent {
         await this.writeBundleToDisk(bundle)
         generatedFiles.push(bundle)
 
-        if (bundle.vitest) unitTestsGenerated++
-        if (bundle.playwright) uiTestsGenerated++
-        if (bundle.k6) perfTestsGenerated++
+        if (bundle.vitest)     { unitTestsGenerated++;  this.logger.ok(`vitest     → ${bundle.vitest.outputPath}`) }
+        else                                             this.logger.skip('vitest     (no testable logic)')
+        if (bundle.playwright) { uiTestsGenerated++;    this.logger.ok(`playwright → ${bundle.playwright.outputPath}`) }
+        else                                             this.logger.skip('playwright (no UI components)')
+        if (bundle.k6)         { perfTestsGenerated++;  this.logger.ok(`k6         → ${bundle.k6.outputPath}`) }
+        else                                             this.logger.skip('k6         (no HTTP endpoints)')
 
         this.auditLog.log({
           agent: 'TestGeneratorAgent',
@@ -104,13 +127,13 @@ export class TestGeneratorAgent {
         })
       } catch (err) {
         skippedFiles.push(file.path)
+        this.logger.error(`Failed: ${(err as Error).message}`)
         this.auditLog.log({
           agent: 'TestGeneratorAgent',
           action: 'ERROR',
           input: { path: file.path },
           reasoning: (err as Error).message,
         })
-        console.error(`TestGeneratorAgent: failed on ${file.path}:`, (err as Error).message)
       }
     }
 
@@ -130,6 +153,30 @@ export class TestGeneratorAgent {
     return output
   }
 
+  private buildUserPrompt(file: ChangedFile, baseUrl: string): string {
+    const content = file.content.length > MAX_FILE_CHARS
+      ? truncateToExports(file.content)
+      : file.content
+    return `Source file: ${file.path}
+Base URL: ${baseUrl}
+Detected endpoints: ${file.detectedEndpoints.join(', ') || 'none'}
+Detected components: ${file.detectedComponents.join(', ') || 'none'}
+Risk level: ${file.risk}
+
+${content}`
+  }
+
+  private async callClaude(systemPrompt: string, userPrompt: string, label: string): Promise<string> {
+    this.logger.streamHeader(label)
+    const text = await this.claudeTool.complete(systemPrompt, userPrompt, {
+      maxTokens: MAX_TOKENS,
+      cacheSystem: true,
+      onToken: (t) => this.logger.token(t),
+    })
+    this.logger.streamEnd()
+    return text
+  }
+
   private async generateForFile(
     file: ChangedFile,
     pullNumber: number,
@@ -137,61 +184,39 @@ export class TestGeneratorAgent {
     outBase: string
   ): Promise<GeneratedTestBundle> {
     const baseName = path.basename(file.path, path.extname(file.path))
-    const content = file.content.length > MAX_FILE_CHARS
-      ? truncateToExports(file.content)
-      : file.content
+    const userPrompt = this.buildUserPrompt(file, baseUrl)
+    const hasEndpoints = file.detectedEndpoints.length > 0
+    const hasComponents = file.detectedComponents.length > 0 || file.category.includes('component')
 
-    const userPrompt = `Source file: ${file.path}
-Base URL for k6: ${baseUrl}
-Detected endpoints: ${file.detectedEndpoints.join(', ') || 'none'}
-Detected components: ${file.detectedComponents.join(', ') || 'none'}
-
-${content}`
-
-    let responseText = await this.claudeTool.complete(SYSTEM_PROMPT, userPrompt, {
-      maxTokens: 8192,
-      cacheSystem: true,
-    })
-
-    let vitest = parseXmlSection(responseText, 'vitest')
-    let playwright = parseXmlSection(responseText, 'playwright')
-    let k6 = parseXmlSection(responseText, 'k6')
-
-    if (!vitest && !playwright && !k6) {
-      this.auditLog.log({
-        agent: 'TestGeneratorAgent',
-        action: 'RETRY',
-        input: { path: file.path },
-        reasoning: 'No XML sections found in first response',
-      })
-      responseText = await this.claudeTool.complete(
-        SYSTEM_PROMPT,
-        userPrompt + '\n\nIMPORTANT: You MUST respond using the <vitest>, <playwright>, and <k6> XML tags. No other format is accepted.',
-        { maxTokens: 8192, cacheSystem: true }
-      )
-      vitest = parseXmlSection(responseText, 'vitest')
-      playwright = parseXmlSection(responseText, 'playwright')
-      k6 = parseXmlSection(responseText, 'k6')
-    }
+    // Three separate calls — each gets full MAX_TOKENS budget
+    const [vitestRaw, playwrightRaw, k6Raw] = await Promise.all([
+      this.callClaude(SYSTEM_VITEST, userPrompt, `${baseName} [vitest]`),
+      hasComponents
+        ? this.callClaude(SYSTEM_PLAYWRIGHT, userPrompt, `${baseName} [playwright]`)
+        : Promise.resolve('SKIP'),
+      hasEndpoints
+        ? this.callClaude(SYSTEM_K6, userPrompt, `${baseName} [k6]`)
+        : Promise.resolve('SKIP'),
+    ])
 
     const bundle: GeneratedTestBundle = { sourcePath: file.path }
 
-    if (vitest) {
+    if (!isSkip(vitestRaw)) {
       bundle.vitest = {
         outputPath: path.join(outBase, 'unit', `${baseName}.test.ts`),
-        content: vitest,
+        content: vitestRaw.trim(),
       }
     }
-    if (playwright) {
+    if (!isSkip(playwrightRaw)) {
       bundle.playwright = {
         outputPath: path.join(outBase, 'ui', `${baseName}.spec.ts`),
-        content: playwright,
+        content: playwrightRaw.trim(),
       }
     }
-    if (k6) {
+    if (!isSkip(k6Raw)) {
       bundle.k6 = {
         outputPath: path.join(outBase, 'perf', `${baseName}.k6.js`),
-        content: k6,
+        content: k6Raw.trim(),
       }
     }
 
@@ -200,7 +225,6 @@ ${content}`
 
   private async writeBundleToDisk(bundle: GeneratedTestBundle): Promise<void> {
     const writes: Promise<void>[] = []
-
     for (const testFile of [bundle.vitest, bundle.playwright, bundle.k6]) {
       if (!testFile) continue
       const dir = path.dirname(testFile.outputPath)
@@ -210,7 +234,6 @@ ${content}`
         )
       )
     }
-
     await Promise.all(writes)
   }
 }

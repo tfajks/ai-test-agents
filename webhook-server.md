@@ -126,7 +126,123 @@ BASE_URL=               # Optional — for k6 scripts
 
 ---
 
-## Deployment options
+## Deployment — AWS Elastic Beanstalk (current)
+
+The server is deployed to **AWS Elastic Beanstalk** (Node.js 20 on AL2023):
+
+| Item | Value |
+|------|-------|
+| Environment | `ai-test-agents-prod` |
+| Region | `us-east-1` |
+| URL | `http://ai-test-agents-prod.eba-pik3yw2m.us-east-1.elasticbeanstalk.com` |
+| Webhook endpoint | `.../webhook` |
+| Health endpoint | `.../health` |
+
+### Checking server health
+
+**Browser / curl:**
+```
+http://ai-test-agents-prod.eba-pik3yw2m.us-east-1.elasticbeanstalk.com/health
+```
+
+**PowerShell:**
+```powershell
+Invoke-WebRequest http://ai-test-agents-prod.eba-pik3yw2m.us-east-1.elasticbeanstalk.com/health
+```
+
+**Expected response:**
+```json
+{"status":"ok","activeRuns":0}
+```
+
+`activeRuns` shows how many pipelines are currently running (at most 1 per repo due to rate limiting).
+
+### Checking EB environment status
+
+```powershell
+aws elasticbeanstalk describe-environments `
+  --environment-names ai-test-agents-prod `
+  --region us-east-1 `
+  --query "Environments[0].[Status,Health,VersionLabel]" `
+  --output text
+```
+
+Returns e.g. `Ready   Green   v6` — healthy and running.
+
+### Viewing recent EB events (errors, deploys)
+
+```powershell
+aws elasticbeanstalk describe-events `
+  --environment-name ai-test-agents-prod `
+  --region us-east-1 `
+  --max-items 10 `
+  --query "Events[*].[Severity,Message]" `
+  --output table
+```
+
+### Adding / updating environment variables
+
+EB does **not** load `.env` — variables must be set explicitly:
+
+```powershell
+aws elasticbeanstalk update-environment `
+  --application-name ai-test-agents `
+  --environment-name ai-test-agents-prod `
+  --region us-east-1 `
+  --option-settings `
+    "Namespace=aws:elasticbeanstalk:application:environment,OptionName=GITHUB_TOKEN,Value=YOUR_TOKEN" `
+    "Namespace=aws:elasticbeanstalk:application:environment,OptionName=WEBHOOK_SECRET,Value=YOUR_SECRET"
+```
+
+Required variables:
+
+| Variable | Description |
+|----------|-------------|
+| `GITHUB_TOKEN` | GitHub PAT with `repo` scope |
+| `WEBHOOK_SECRET` | Must match the secret set in the GitHub webhook |
+| `AWS_REGION` | Already set — `us-east-1` |
+| `BEDROCK_MODEL_ID` | Already set — `us.anthropic.claude-sonnet-4-6` |
+| `GITHUB_OWNER` | Already set — `tfajks` |
+| `GITHUB_REPO` | Already set — `uigen` |
+
+### Redeploying after code changes
+
+```powershell
+# 1. Rebuild TypeScript
+npm run build
+
+# 2. Create ZIP with forward-slash paths (required for Linux extraction)
+# Run the PowerShell script: scripts/package.ps1
+# Or manually via System.IO.Compression (see deploy notes)
+
+# 3. Upload and create new version
+aws s3 cp deploy-vN.zip s3://elasticbeanstalk-us-east-1-381491969811/ai-test-agents/deploy-vN.zip
+aws elasticbeanstalk create-application-version --application-name ai-test-agents --version-label vN --source-bundle S3Bucket=elasticbeanstalk-us-east-1-381491969811,S3Key=ai-test-agents/deploy-vN.zip --region us-east-1
+aws elasticbeanstalk update-environment --environment-name ai-test-agents-prod --version-label vN --region us-east-1
+```
+
+> **Important:** Use `System.IO.Compression.ZipArchive` (not `Compress-Archive`) to create the ZIP — `Compress-Archive` generates Windows backslash paths that EB/Linux cannot extract correctly.
+
+### GitHub webhook configuration
+
+The webhook is registered on `tfajks/uigen` (webhook ID `619749955`):
+
+- URL: `http://ai-test-agents-prod.eba-pik3yw2m.us-east-1.elasticbeanstalk.com/webhook`
+- Events: `pull_request` only
+- Secret: matches `WEBHOOK_SECRET` in EB env vars
+
+To update the webhook URL (e.g. after redeployment to a new domain):
+```powershell
+curl -X PATCH `
+  -H "Authorization: token YOUR_GITHUB_TOKEN" `
+  -H "Content-Type: application/json" `
+  https://api.github.com/repos/tfajks/uigen/hooks/619749955 `
+  -d '{"config":{"url":"https://NEW-URL/webhook","content_type":"json","secret":"YOUR_SECRET"}}'
+```
+
+---
+
+## Other deployment options
 
 | Platform | Notes |
 |----------|-------|
@@ -134,8 +250,6 @@ BASE_URL=               # Optional — for k6 scripts
 | **Azure Functions** | Natural fit for Accenture/enterprise environments |
 | **Google Cloud Run** | Auto-scales to zero; simple Docker deploy |
 | **Railway / Render** | Fastest to set up for demos |
-
-For the certification demo, any platform that gives you a public HTTPS URL works. The simplest path is **Railway** (free tier, one-click Node.js deploy).
 
 ---
 

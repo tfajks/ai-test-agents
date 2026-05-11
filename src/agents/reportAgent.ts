@@ -4,6 +4,7 @@ import { GitHubTool } from '../tools/githubTool'
 import { ClaudeTool } from '../tools/claudeTool'
 import { MemoryStore } from '../memory/memoryStore'
 import { AuditLog } from '../audit/auditLog'
+import { Logger } from '../logger'
 import { GoNoGo, ReportAgentOutput, RiskLevel, TestScore } from '../types'
 
 interface ScoringResult {
@@ -14,9 +15,9 @@ interface ScoringResult {
 }
 
 function computeGoNoGo(risk: RiskLevel, avgScore: number): GoNoGo {
-  if (risk === 'critical') return 'no-go'
-  if (risk === 'high' || avgScore < 5) return 'no-go'
-  if (risk === 'medium' || avgScore < 8) return 'go-with-caution'
+  if (avgScore < 5) return 'no-go'
+  if (risk === 'critical' && avgScore < 8) return 'no-go'
+  if (risk === 'critical' || risk === 'high' || avgScore < 8) return 'go-with-caution'
   return 'go'
 }
 
@@ -33,10 +34,12 @@ export class ReportAgent {
     private githubTool: GitHubTool,
     private claudeTool: ClaudeTool,
     private memoryStore: MemoryStore,
-    private auditLog: AuditLog
+    private auditLog: AuditLog,
+    private logger: Logger
   ) {}
 
   async run(owner: string, repo: string, pullNumber: number, dryRun: boolean): Promise<ReportAgentOutput> {
+    this.logger.section('REPORT AGENT', '📊')
     this.auditLog.log({ agent: 'ReportAgent', action: 'STARTED', input: { owner, repo, pullNumber, dryRun } })
 
     const ingest = this.memoryStore.get('ingest')
@@ -49,19 +52,26 @@ export class ReportAgent {
       if (bundle.k6) testContents.push({ path: bundle.k6.outputPath, type: 'perf', content: bundle.k6.content })
     }
 
+    this.logger.info(`Scoring ${testContents.length} generated test files`)
     this.auditLog.log({
       agent: 'ReportAgent',
       action: 'SCORING',
       input: { testFileCount: testContents.length },
     })
 
+    this.logger.streamHeader('scoring & risk assessment')
     const scoring = await this.scoreTests(ingest.changedFiles, testContents)
     const avgScore =
       scoring.testScores.length > 0
         ? scoring.testScores.reduce((s, t) => s + t.score, 0) / scoring.testScores.length
         : 0
 
+    this.logger.streamEnd()
     const goNoGo = computeGoNoGo(scoring.overallRisk, avgScore)
+
+    for (const s of scoring.testScores) {
+      this.logger.ok(`${path.basename(s.filePath)}  ${s.score}/10  — ${s.notes}`)
+    }
 
     this.auditLog.log({
       agent: 'ReportAgent',
@@ -81,12 +91,14 @@ export class ReportAgent {
 
     let prCommentUrl = ''
     if (!dryRun) {
+      this.logger.step('Posting PR comment')
       prCommentUrl = await this.githubTool.createComment(
         owner,
         repo,
         pullNumber,
         comment
       )
+      this.logger.ok(`Comment posted: ${prCommentUrl}`)
       this.auditLog.log({ agent: 'ReportAgent', action: 'COMMENT_POSTED', output: { url: prCommentUrl } })
     } else {
       this.auditLog.log({ agent: 'ReportAgent', action: 'COMMENT_SKIPPED', reasoning: 'dry-run mode' })
@@ -118,6 +130,7 @@ export class ReportAgent {
 
     this.memoryStore.set('report', output)
     this.auditLog.log({ agent: 'ReportAgent', action: 'COMPLETED', output: { goNoGo, reportPath } })
+    this.logger.done(`Go/No-Go: ${goNoGoEmoji(goNoGo)}  |  Avg score: ${output.averageScore}/10  |  Risk: ${riskEmoji(scoring.overallRisk)} ${scoring.overallRisk}`)
     return output
   }
 
@@ -133,10 +146,7 @@ Output ONLY valid JSON — no markdown, no code fences.`
       .join('\n')
 
     const testsSummary = testContents
-      .map(
-        (t) =>
-          `### ${t.path} (${t.type})\n${t.content.slice(0, 1500)}${t.content.length > 1500 ? '\n...(truncated)' : ''}`
-      )
+      .map((t) => `### ${t.path} (${t.type})\n${t.content.slice(0, 6000)}`)
       .join('\n\n')
 
     const userPrompt = `PR changed these files:
