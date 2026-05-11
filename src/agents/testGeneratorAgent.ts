@@ -186,7 +186,12 @@ ${content}`
     const baseName = path.basename(file.path, path.extname(file.path))
     const userPrompt = this.buildUserPrompt(file, baseUrl)
     const hasEndpoints = file.detectedEndpoints.length > 0
-    const hasComponents = file.detectedComponents.length > 0 || file.category.includes('component')
+    // Playwright only for page-level components or files with endpoints — not UI primitives
+    const isPageLevel = /\/(pages|app|routes|views)\//i.test(file.path) ||
+      /page\.(tsx?|jsx?)$/.test(file.path) ||
+      /layout\.(tsx?|jsx?)$/.test(file.path)
+    const hasComponents = (file.detectedComponents.length > 0 || file.category.includes('component')) &&
+      (isPageLevel || hasEndpoints)
 
     // Three separate calls — each gets full MAX_TOKENS budget
     const [vitestRaw, playwrightRaw, k6Raw] = await Promise.all([
